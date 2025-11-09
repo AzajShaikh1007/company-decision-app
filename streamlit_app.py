@@ -1,82 +1,138 @@
+# streamlit_app.py
 import streamlit as st
 import pandas as pd
+import requests
+import os
+from datetime import datetime
 
 st.set_page_config(page_title="Company Decision Engine", layout="wide")
-st.title("📈 Company Decision Engine — Flowchart Automation")
+st.title("📈 Company Decision Engine — Upload or Live API")
 
-st.markdown("""
-Upload an Excel (.xlsx) with columns:
-`Company`, `Revenue_Growth_pct`, `PE`, `PEG`, `ROE_5yr_Avg`, `Quick_Ratio`
-""")
+# ========== COMPANY SYMBOLS ==========
+COMPANIES = {
+    "CHENNPETRO.NS": "Chennai Petroleum Corporation Ltd",
+    "COALINDIA.NS": "Coal India Ltd",
+    "BEML.NS": "BEML Ltd",
+    "SUNPHARMA.NS": "Sun Pharmaceutical Industries Ltd",
+    "HINDCOPPER.NS": "Hindustan Copper Ltd",
+    "ITC.NS": "ITC Ltd",
+    "IOC.NS": "Indian Oil Corporation Ltd",
+    "ONGC.NS": "ONGC Ltd",
+    "HINDUNILVR.NS": "Hindustan Unilever Ltd",
+    "MAHANGAS.NS": "Mahanagar Gas Ltd",
+    "CASTROLIND.NS": "Castrol India Ltd",
+    "MCDOWELL-N.NS": "United Spirits Ltd",
+    "PRAJIND.NS": "Praj Industries Ltd"
+}
 
-uploaded_file = st.file_uploader("Upload companies.xlsx", type=["xlsx"])
-if uploaded_file is None:
-    st.info("Try the sample data: copy the template into Excel and upload the .xlsx file.")
+# ========== API KEY ==========
+if "FMP_API_KEY" in st.secrets:
+    API_KEY = st.secrets["FMP_API_KEY"]
 else:
+    API_KEY = os.environ.get("FMP_API_KEY")
+
+if not API_KEY:
+    st.error("❌ API Key missing! Add your FMP_API_KEY in Streamlit Secrets.")
+    st.stop()
+
+# ========== FMP FETCH FUNCTION ==========
+@st.cache_data(ttl=12 * 60 * 60)
+def fetch_company_metrics(symbol: str):
+    """Fetch financial ratios for one company symbol and handle missing data."""
+    base = "https://financialmodelingprep.com/api/v3"
+    profile_url = f"{base}/profile/{symbol}?apikey={API_KEY}"
+    ratios_url = f"{base}/ratios/{symbol}?limit=1&apikey={API_KEY}"
+
+    result = {
+        "Symbol": symbol,
+        "Name": COMPANIES.get(symbol, ""),
+        "PE": None,
+        "PEG": None,
+        "Revenue_Growth_pct": None,
+        "Quick_Ratio": None,
+        "ROE_pct": None,
+        "Status": "Success"
+    }
+
     try:
-        df = pd.read_excel(uploaded_file, engine="openpyxl")
+        profile = requests.get(profile_url, timeout=10).json()
+        if isinstance(profile, list) and len(profile) > 0:
+            result["PE"] = profile[0].get("pe", None)
+        else:
+            result["Status"] = "No profile data"
     except Exception as e:
-        st.error(f"Failed to read Excel file: {e}")
-        st.stop()
+        result["Status"] = f"Profile error: {str(e)}"
 
-    required_cols = ["Company","Revenue_Growth_pct","PE","PEG","ROE_5yr_Avg","Quick_Ratio"]
-    missing = [c for c in required_cols if c not in df.columns]
-    if missing:
-        st.error(f"Missing columns in uploaded file: {missing}")
-        st.stop()
+    try:
+        ratios = requests.get(ratios_url, timeout=10).json()
+        if isinstance(ratios, list) and len(ratios) > 0:
+            r = ratios[0]
+            if r.get("revenueGrowth") is not None:
+                result["Revenue_Growth_pct"] = float(r["revenueGrowth"]) * 100
+            result["PEG"] = r.get("pegRatio", r.get("peg_ratio", None))
+            if r.get("returnOnEquity") is not None:
+                result["ROE_pct"] = float(r["returnOnEquity"]) * 100
+            result["Quick_Ratio"] = r.get("quickRatio", None)
+        else:
+            result["Status"] = "No ratios data"
+    except Exception as e:
+        result["Status"] = f"Ratios error: {str(e)}"
 
-    for col in required_cols[1:]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+    # mark as failed if no key metrics
+    if all(val is None for val in [result["PE"], result["Revenue_Growth_pct"], result["Quick_Ratio"]]):
+        result["Status"] = "Failed - no usable data"
 
-    def decide(row,
-               rev_growth_threshold=10,
-               pe_threshold=25,
-               peg_threshold=2,
-               roe_threshold=5,
-               quick_ratio_threshold=1.5):
-        rg = row["Revenue_Growth_pct"]
-        pe = row["PE"]
-        peg = row["PEG"]
-        roe = row["ROE_5yr_Avg"]
-        qr = row["Quick_Ratio"]
+    return result
 
-        if pd.isna(rg) or pd.isna(pe) or pd.isna(peg) or pd.isna(roe) or pd.isna(qr):
-            return "Insufficient data"
-        if rg < rev_growth_threshold:
-            return "Low revenue growth"
-        if pe >= pe_threshold:
-            return "Likely overvalued"
-        if peg >= peg_threshold:
-            return "Low profit growth"
-        if roe < roe_threshold:
-            return "Weak profitability"
-        if qr < quick_ratio_threshold:
-            return "Liquidity issues"
-        return "Invest"
+# ========== UI ==========
+st.sidebar.header("Select Data Source")
+mode = st.sidebar.radio("Choose mode", ["Upload Excel (manual)", "Live API (FMP)"])
 
-    st.sidebar.header("Decision thresholds (adjust if needed)")
-    rev_growth_threshold = st.sidebar.number_input("Revenue growth % threshold", value=10.0)
-    pe_threshold = st.sidebar.number_input("P/E threshold", value=25.0)
-    peg_threshold = st.sidebar.number_input("PEG threshold", value=2.0)
-    roe_threshold = st.sidebar.number_input("ROE (5yr avg) threshold", value=5.0)
-    quick_ratio_threshold = st.sidebar.number_input("Quick ratio threshold", value=1.5)
+# ========== EXCEL MODE ==========
+if mode == "Upload Excel (manual)":
+    st.info("Upload an Excel (.xlsx) with columns: Company, Revenue_Growth_pct, PE, PEG, ROE_5yr_Avg, Quick_Ratio")
+    uploaded_file = st.file_uploader("Upload your Excel file", type=["xlsx"])
+    if uploaded_file:
+        df = pd.read_excel(uploaded_file, engine="openpyxl")
+        st.success("✅ File uploaded successfully!")
+        st.dataframe(df)
+    else:
+        st.warning("Please upload a file to continue.")
 
-    df["Decision"] = df.apply(decide, axis=1,
-                              rev_growth_threshold=rev_growth_threshold,
-                              pe_threshold=pe_threshold,
-                              peg_threshold=peg_threshold,
-                              roe_threshold=roe_threshold,
-                              quick_ratio_threshold=quick_ratio_threshold)
+# ========== LIVE API MODE ==========
+else:
+    st.info("Fetching live data from FinancialModelingPrep (this may take 10–20 seconds)...")
 
-    st.subheader("Results")
-    st.dataframe(df, height=400)
+    progress = st.progress(0)
+    all_results = []
 
-    @st.cache_data
-    def to_excel(dataframe):
+    for i, (sym, name) in enumerate(COMPANIES.items()):
+        progress.progress((i + 1) / len(COMPANIES))
+        data = fetch_company_metrics(sym)
+        all_results.append(data)
+
+    df = pd.DataFrame(all_results)
+
+    # Split into success and failed
+    failed_df = df[df["Status"] != "Success"]
+    success_df = df[df["Status"] == "Success"]
+
+    # Display results
+    st.success(f"✅ Successfully fetched data for {len(success_df)} companies.")
+    if len(failed_df) > 0:
+        st.warning(f"⚠️ Failed or incomplete data for {len(failed_df)} companies:")
+        st.dataframe(failed_df[["Symbol", "Name", "Status"]])
+
+    st.dataframe(success_df.drop(columns=["Status"]), height=500)
+
+    # Download successful data as Excel
+    def to_excel_bytes(dataframe):
         import io
         with io.BytesIO() as buffer:
             with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-                dataframe.to_excel(writer, index=False, sheet_name="Results")
+                dataframe.to_excel(writer, index=False)
             return buffer.getvalue()
 
-    st.download_button("⬇️ Download results as Excel", data=to_excel(df), file_name="company_decisions.xlsx")
+    st.download_button("⬇️ Download successful data (Excel)",
+                       data=to_excel_bytes(success_df),
+                       file_name="company_metrics_success.xlsx")
